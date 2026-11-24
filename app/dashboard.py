@@ -1,4 +1,4 @@
-"""Pygame dashboard for the live pitch engine, displayed with D in the game."""
+"""Live DSP dashboard displayed beside the game."""
 import math
 import os
 
@@ -47,29 +47,51 @@ class Dashboard:
     PANEL = (25, 38, 53)
     GRID = (52, 69, 82)
     TEXT = (225, 235, 239)
-    MUTED = (156, 177, 187)
+    MUTED = (180, 196, 210)
     CYAN = (77, 218, 225)
     ORANGE = (255, 179, 85)
     GREEN = (135, 229, 159)
 
     def __init__(self):
-        self.font = pygame.font.Font(None, 19)
+        self.font = pygame.font.Font(None, 18)
         self.small = pygame.font.Font(None, 16)
         self.title = pygame.font.Font(None, 24)
 
-    def _text(self, surface, text, pos, color=None, font=None):
-        image = (font or self.font).render(str(text), True, color or self.TEXT)
+    def _text(self, surface, text, pos, color=None, font=None, max_width=None):
+        font = font or self.font
+        text = str(text)
+        if max_width is not None and font.size(text)[0] > max_width:
+            while text and font.size(text + "...")[0] > max_width:
+                text = text[:-1]
+            text += "..."
+        image = font.render(text, True, color or self.TEXT)
         surface.blit(image, pos)
+        return image.get_size()
 
-    def _panel(self, surface, rect, title):
+    def _right_text(self, surface, text, right, y, color=None):
+        width = self.small.size(str(text))[0]
+        self._text(surface, text, (right - width, y), color, self.small)
+
+    def _panel(self, surface, rect, title, subtitle, caption):
         pygame.draw.rect(surface, self.PANEL, rect, border_radius=5)
         pygame.draw.rect(surface, self.GRID, rect, 1, border_radius=5)
-        self._text(surface, title, (rect.x + 8, rect.y + 5), self.TEXT, self.small)
-        plot = pygame.Rect(rect.x + 41, rect.y + 25, rect.w - 52, rect.h - 45)
+        self._text(surface, title, (rect.x + 8, rect.y + 5), self.TEXT, self.font,
+                   rect.w - 16)
+        self._text(surface, subtitle, (rect.x + 8, rect.y + 23), self.MUTED, self.small,
+                   rect.w - 16)
+        plot = pygame.Rect(rect.x + 48, rect.y + 42, rect.w - 58, rect.h - 76)
         for fraction in (0.0, 0.5, 1.0):
             y = round(plot.top + fraction * (plot.h - 1))
-            pygame.draw.line(surface, self.GRID, (plot.left, y), (plot.right, y))
+            pygame.draw.line(surface, self.GRID, (plot.left, y), (plot.right - 1, y))
+        self._text(surface, caption, (rect.x + 8, rect.bottom - 16), self.MUTED,
+                   self.small, rect.w - 16)
         return plot
+
+    def _axes(self, surface, rect, plot, high, low, left, right):
+        self._text(surface, high, (rect.x + 4, plot.top), self.MUTED, self.small)
+        self._text(surface, low, (rect.x + 4, plot.bottom - 13), self.MUTED, self.small)
+        self._text(surface, left, (plot.left, plot.bottom + 2), self.MUTED, self.small)
+        self._right_text(surface, right, plot.right, plot.bottom + 2, self.MUTED)
 
     @staticmethod
     def _curve(surface, rect, x, y, xmin, xmax, ymin, ymax, color):
@@ -91,88 +113,108 @@ class Dashboard:
         if len(points) > 1:
             pygame.draw.lines(surface, color, False, points, 1)
 
+    @staticmethod
+    def _max_freq(state):
+        freqs = state.get("spec_freqs", [])
+        if len(freqs):
+            return float(freqs[-1])
+        return MODES.get(state.get("mode"), MODES["hum"])["disp"]
+
     def _waveform(self, surface, rect, state):
-        plot = self._panel(surface, rect, "WAVEFORM   raw (cyan) / filtered (orange)")
+        plot = self._panel(surface, rect, "1. WAVEFORM", "Cyan: input   |   Orange: filtered",
+                           "Amplitude versus time")
         raw = np.asarray(state.get("raw_wave", []), dtype=float)
         filt = np.asarray(state.get("filt_wave", []), dtype=float)
         peak = max(0.02, float(np.max(np.abs(raw))) if raw.size else 0,
                    float(np.max(np.abs(filt))) if filt.size else 0)
-        self._text(surface, f"{peak:.2f}", (rect.x + 4, plot.top), self.MUTED, self.small)
-        self._text(surface, f"-{peak:.2f}", (rect.x + 2, plot.bottom - 12), self.MUTED, self.small)
-        fs = state.get("fs", 16000)
-        n = max(raw.size, filt.size)
-        duration = max((n - 1) / fs * 1000, 0.01)
+        fs = state.get("fs") or 16000
+        duration = max((max(raw.size, filt.size) - 1) / fs * 1000, 0.01)
         for wave, color in ((raw, self.CYAN), (filt, self.ORANGE)):
             if wave.size:
                 self._curve(surface, plot, np.arange(wave.size) / fs * 1000, wave,
                             0, duration, -peak, peak, color)
-        self._text(surface, f"0                         {duration:.0f} ms",
-                   (plot.left, plot.bottom + 3), self.MUTED, self.small)
+        self._axes(surface, rect, plot, f"{peak:.2f}", f"-{peak:.2f}", "0 ms",
+                   f"{duration:.0f} ms")
 
     def _spectrum(self, surface, rect, state):
-        name = "raw" if state.get("bypass") else "filtered"
-        plot = self._panel(surface, rect, f"SPECTRUM  ({name}, dB)")
+        name = "input" if state.get("bypass") else "filtered"
+        plot = self._panel(surface, rect, "2. SPECTRUM", f"{name.title()} FFT  |  White: estimated f0",
+                           "Peaks: tones / harmonics; unnormalized dB")
         freqs = np.asarray(state.get("spec_freqs", []), dtype=float)
         db = np.asarray(state.get("spec_db", []), dtype=float)
-        max_freq = float(freqs[-1]) if freqs.size else MODES[state.get("mode", "hum")]["disp"]
+        max_freq = self._max_freq(state)
         self._curve(surface, plot, freqs, db, 0, max_freq, -80, 40, self.CYAN)
-        self._text(surface, "40", (rect.x + 10, plot.top), self.MUTED, self.small)
-        self._text(surface, "-80", (rect.x + 7, plot.bottom - 12), self.MUTED, self.small)
-        self._text(surface, f"0                                      {max_freq:.0f} Hz",
-                   (plot.left, plot.bottom + 3), self.MUTED, self.small)
+        f0 = state.get("f0")
+        if f0 is not None and math.isfinite(f0) and 0 <= f0 <= max_freq:
+            x = plot.left + round((f0 / max_freq) * (plot.w - 1))
+            for y in range(plot.top, plot.bottom, 6):
+                pygame.draw.line(surface, self.TEXT, (x, y), (x, min(y + 2, plot.bottom - 1)))
+        self._axes(surface, rect, plot, "+40 dB", "-80 dB", "0 Hz", f"{max_freq:.0f} Hz")
 
     def _spectrogram(self, surface, rect, state, engine):
-        plot = self._panel(surface, rect, "SPECTROGRAM  (one column / hop, dB)")
+        plot = self._panel(surface, rect, "3. SPECTROGRAM", "Frequency over time; brighter = stronger",
+                           "Bands: harmonics  |  -80 to +40 dB")
         spec = np.asarray(engine.get_spectrogram(), dtype=float)
-        if spec.ndim == 2 and spec.size:
+        freqs = state.get("spec_freqs", [])
+        if spec.ndim == 2 and spec.size and len(freqs) == spec.shape[0]:
             level = np.clip((np.nan_to_num(spec, nan=-80) + 80) / 120, 0, 1)
-            # pygame's surfarray is indexed (x, y); flip frequency so low is at the bottom.
-            level = np.flipud(level).T
+            level = np.flipud(level).T  # pygame arrays use (x, y); low frequencies at bottom.
             rgb = np.empty((*level.shape, 3), dtype=np.uint8)
             rgb[..., 0] = np.clip((level - 0.35) * 2.5, 0, 1) * 255
             rgb[..., 1] = np.clip(level * 2, 0, 1) * 190
             rgb[..., 2] = np.clip(level * 3, 0, 1) * 200
-            image = pygame.surfarray.make_surface(rgb)
-            surface.blit(pygame.transform.scale(image, plot.size), plot)
-        freqs = state.get("spec_freqs", [])
-        max_freq = float(freqs[-1]) if len(freqs) else MODES[state.get("mode", "hum")]["disp"]
-        self._text(surface, f"{max_freq:.0f}", (rect.x + 2, plot.top), self.MUTED, self.small)
-        self._text(surface, "0 Hz", (rect.x + 3, plot.bottom - 12), self.MUTED, self.small)
-        self._text(surface, "older                                  now",
-                   (plot.left, plot.bottom + 3), self.MUTED, self.small)
+            surface.blit(pygame.transform.scale(pygame.surfarray.make_surface(rgb), plot.size), plot)
+            hop = state.get("hop") or 256
+            fs = state.get("fs") or 16000
+            seconds = max(0, spec.shape[1] - 1) * hop / fs
+            left = f"-{seconds:.1f} s"
+        else:
+            left = "older"
+        self._axes(surface, rect, plot, f"{self._max_freq(state):.0f}", "0 Hz", left, "now")
 
     def _pitch_track(self, surface, rect, state, engine):
-        plot = self._panel(surface, rect, "PITCH TRACK   raw (cyan) / smoothed (orange)")
+        plot = self._panel(surface, rect, "4. PITCH TRACK", "Cyan: f0   |   Orange: smoothed",
+                           "Orange holds when no pitch is detected")
         history = engine.get_history()
         t = np.asarray(history.get("t", []), dtype=float)
-        mode = MODES[state.get("mode", "hum")]
+        mode = MODES.get(state.get("mode"), MODES["hum"])
         lo, hi = mode["fmin"], mode["fmax"]
         for key, color in (("f0", self.CYAN), ("smooth_hz", self.ORANGE)):
             hz = np.asarray(history.get(key, []), dtype=float)
             with np.errstate(divide="ignore", invalid="ignore"):
                 values = np.where(hz > 0, np.log2(hz), np.nan)
             self._curve(surface, plot, t, values, -8, 0, math.log2(lo), math.log2(hi), color)
-        self._text(surface, f"{hi:.0f}", (rect.x + 2, plot.top), self.MUTED, self.small)
-        self._text(surface, f"{lo:.0f} Hz", (rect.x + 2, plot.bottom - 12), self.MUTED, self.small)
-        self._text(surface, "-8 s                                      now",
-                   (plot.left, plot.bottom + 3), self.MUTED, self.small)
+        self._axes(surface, rect, plot, f"{hi:.0f}", f"{lo:.0f} Hz", "-8 s", "now")
 
     def draw(self, surface, engine, state, pitch_range, pitch_control=True,
              fallback_reason=None, game_state="game"):
+        """Draw all plots and controls at the size of the supplied surface."""
         surface.fill(self.BACKGROUND)
-        self._text(surface, "HUMMING BIRD  /  LIVE DSP", (12, 8), self.CYAN, self.title)
-        self._text(surface, f"{game_state.upper()} PAUSED  -  D or ESC to return",
-                   (580, 11), self.MUTED, self.small)
-        self._waveform(surface, pygame.Rect(12, 38, 460, 148), state)
-        self._spectrum(surface, pygame.Rect(488, 38, 460, 148), state)
-        self._spectrogram(surface, pygame.Rect(12, 194, 460, 148), state, engine)
-        self._pitch_track(surface, pygame.Rect(488, 194, 460, 148), state, engine)
+        width, height = surface.get_size()
+        self._text(surface, "LIVE PITCH LAB", (12, 9), self.CYAN, self.title)
+        self._right_text(surface, "PLAYING" if game_state == "game" else game_state.upper(),
+                         width - 12, 13, self.GREEN)
 
         def number(value, decimals=1):
             return f"{value:.{decimals}f}" if value is not None and math.isfinite(value) else "--"
 
         f0 = number(state.get("f0"))
-        cents = number(state.get("cents"), 0)
+        note = state.get("note") or "--"
+        gate = "OPEN" if state.get("gate_open") else "CLOSED"
+        self._text(surface, f"Pitch: {f0} Hz  |  Note: {note}  |  Gate: {gate}",
+                   (12, 37), self.TEXT, self.font, width - 24)
+
+        gap, top, footer = 8, 62, 190
+        panel_width = (width - 3 * gap) // 2
+        panel_height = (height - top - footer - 3 * gap) // 2
+        rects = [pygame.Rect(gap + col * (panel_width + gap),
+                             top + row * (panel_height + gap), panel_width, panel_height)
+                 for row in range(2) for col in range(2)]
+        self._waveform(surface, rects[0], state)
+        self._spectrum(surface, rects[1], state)
+        self._spectrogram(surface, rects[2], state, engine)
+        self._pitch_track(surface, rects[3], state, engine)
+
         low = hz_to_note(semitone_to_hz(pitch_range.low))[0]
         high = hz_to_note(semitone_to_hz(pitch_range.high))[0]
         source = str(state.get("source", engine.actual_source))
@@ -181,21 +223,25 @@ class Dashboard:
         if fallback_reason:
             source += " (mic unavailable)"
         snr = state.get("noise_snr_db", engine.noise_snr_db)
+        fs = state.get("fs", engine.fs)
+        n = state.get("N", engine.N)
         lines = [
-            f"Source: {source}   |   {'PITCH' if pitch_control else 'MANUAL'}   |   Range: {low} - {high}",
-            f"f0: {f0} Hz   Note: {state.get('note') or '--'}  {cents} cents   Confidence: {number(state.get('confidence'), 2)}   Gate: {'OPEN' if state.get('gate_open') else 'CLOSED'}",
-            f"Method: {engine.method.upper()}   Window: {engine.window}   Mode: {engine.mode}   Filter: {'bypass' if engine.bypass else 'on'}   Noise: {'off' if snr is None else str(snr) + ' dB'}",
-            f"N: {state.get('N', engine.N)}   Hop: {state.get('hop', engine.N // 4)}   fs: {number(state.get('fs', engine.fs), 0)} Hz   RMS: {number(state.get('rms'), 4)}   Floor: {number(state.get('noise_floor'), 4)}",
-            f"Smoothed: {number(state.get('semitone'), 2)} st / {number(state.get('smooth_hz'))} Hz   Pipeline: {number(state.get('pipeline_ms'))} ms   Estimated latency: {number(state.get('est_latency_ms'))} ms",
+            f"Input: {source}  |  Control: {'pitch' if pitch_control else 'manual'}  |  Range: {low} - {high}",
+            f"Smoothed: {number(state.get('smooth_hz'))} Hz  |  Confidence: {number(state.get('confidence'), 2)} (method-specific)",
+            f"Method: {engine.method.upper()}  |  Mode: {engine.mode}  |  Window: {engine.window}",
+            f"Filter: {'bypass' if engine.bypass else 'on'}  |  Added noise: {'off' if snr is None else str(snr) + ' dB'}",
+            f"Frame: {n}  |  Hop: {state.get('hop', n // 4)}  |  fs: {number(fs, 0)} Hz  |  FFT bins: {number(fs / n, 1)} Hz",
+            f"Latency budget: {number(state.get('est_latency_ms'))} ms (estimated)  |  Block age: {number(state.get('pipeline_ms'))} ms",
+            "Gate open means signal above threshold, not necessarily a valid pitch.",
+            "FFT peaks can be harmonics; dB values depend on frame and window.",
+            "1/2/3: FFT/AMDF/ACF   W: window   B: bypass   M: hum/whistle",
+            "[ / ]: frame size   N: added noise   C: calibrate   SPACE/P: control",
         ]
-        for i, line in enumerate(lines):
-            self._text(surface, line, (14, 351 + 17 * i), self.TEXT, self.small)
-        self._text(surface, "KEY MAP", (14, 443), self.CYAN, self.small)
-        self._text(surface, "1/2/3: FFT / AMDF / ACF     W: window     B: filter bypass     M: hum / whistle",
-                   (14, 461), self.TEXT, self.small)
-        self._text(surface, "[ / ]: frame size     N: injected noise SNR     C: calibrate mic     D: dashboard",
-                   (14, 478), self.TEXT, self.small)
-        self._text(surface, "SPACE: manual flap     P: pitch control     ENTER: start / record     ESC: back",
-                   (14, 495), self.TEXT, self.small)
+        y = rects[-1].bottom + 10
+        for index, line in enumerate(lines):
+            color = self.CYAN if index >= 8 else (self.MUTED if index >= 6 else self.TEXT)
+            self._text(surface, line, (12, y), color, self.small, width - 24)
+            y += 16
         if state.get("error"):
-            self._text(surface, f"Audio error: {state['error']}"[:120], (14, 515), self.ORANGE, self.small)
+            self._text(surface, f"Audio error: {state['error']}", (12, y), self.ORANGE,
+                       self.small, width - 24)

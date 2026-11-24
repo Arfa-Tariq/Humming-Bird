@@ -15,16 +15,19 @@ from app.calibration import Calibration, default_range
 # GAME WINDOW
 # --------------------------------------------------
 
-WIDTH = 960
-HEIGHT = 540
+WIDTH = 1440
+HEIGHT = 800
+MIN_WINDOW_WIDTH = 960
+MIN_WINDOW_HEIGHT = 600
 
 GAME_WIDTH = 320
 GAME_HEIGHT = 180
-SCALE = 3
 
 screen = None
 canvas = None
 clock = None
+game_rect = pygame.Rect(0, 0, GAME_WIDTH, GAME_HEIGHT)
+dashboard_rect = pygame.Rect(0, 0, 0, 0)
 
 # --------------------------------------------------
 # MENU MUSIC
@@ -110,19 +113,46 @@ def stop_menu_music():
 
 # Initialized by main() so importing game logic does not open a window.
 title_font = medium_font = small_font = how_to_font = None
+ui_font = ui_title_font = None
+
+
+def layout_for_window(size):
+    """Return non-overlapping game and dashboard rectangles for a window."""
+    width, height = size
+    split = int(width * 0.43)
+    game_width = min(split - 32, int((height - 200) * GAME_WIDTH / GAME_HEIGHT))
+    game_width = max(1, game_width)
+    game_height = max(1, round(game_width * GAME_HEIGHT / GAME_WIDTH))
+    game = pygame.Rect((split - game_width) // 2, 52, game_width, game_height)
+    return game, pygame.Rect(split, 0, width - split, height)
+
+
+def screen_to_game(pos):
+    """Translate a window mouse position into pixel-art game coordinates."""
+    if not game_rect.collidepoint(pos):
+        return None
+    return (int((pos[0] - game_rect.left) * GAME_WIDTH / game_rect.width),
+            int((pos[1] - game_rect.top) * GAME_HEIGHT / game_rect.height))
 
 
 def initialize_display():
-    global screen, canvas, clock, title_font, medium_font, small_font, how_to_font
+    global screen, canvas, clock, game_rect, dashboard_rect
+    global title_font, medium_font, small_font, how_to_font, ui_font, ui_title_font
     pygame.init()
-    screen = pygame.display.set_mode((WIDTH, HEIGHT))
-    pygame.display.set_caption("Humming Bird - Flower Adventure")
+    info = pygame.display.Info()
+    width = min(WIDTH, max(MIN_WINDOW_WIDTH, info.current_w - 40))
+    height = min(HEIGHT, max(MIN_WINDOW_HEIGHT, info.current_h - 100))
+    screen = pygame.display.set_mode((width, height), pygame.RESIZABLE)
+    game_rect, dashboard_rect = layout_for_window(screen.get_size())
+    pygame.display.set_caption("Humming Bird - Live Pitch Lab")
     canvas = pygame.Surface((GAME_WIDTH, GAME_HEIGHT))
     clock = pygame.time.Clock()
     title_font = pygame.font.Font(None, 30)
     medium_font = pygame.font.Font(None, 18)
     small_font = pygame.font.Font(None, 12)
     how_to_font = pygame.font.Font(None, 16)
+    ui_font = pygame.font.Font(None, 19)
+    ui_title_font = pygame.font.Font(None, 25)
 
 # --------------------------------------------------
 # COLOURS
@@ -549,13 +579,7 @@ def draw_menu(surface):
 
     draw_background(surface)
 
-    mouse_pos = pygame.mouse.get_pos()
-
-    # Convert mouse position to our small pixel screen
-    mouse_pos = (
-        mouse_pos[0] // SCALE,
-        mouse_pos[1] // SCALE
-    )
+    mouse_pos = screen_to_game(pygame.mouse.get_pos()) or (-1, -1)
 
     # Title
     draw_text(
@@ -657,7 +681,7 @@ def draw_how_to_play(surface):
         "2. Fly through gaps; silence makes you fall.",
         "3. Rest on flowers; hum higher to take off.",
         "4. SPACE: manual flap; P: pitch control.",
-        "5. D: dashboard, C: calibrate, ESC: back."
+        "5. C: calibrate; ESC: back to menu."
     ]
 
     for i, instruction in enumerate(instructions):
@@ -671,12 +695,7 @@ def draw_how_to_play(surface):
             58 + i * 14
         )
 
-    mouse_pos = pygame.mouse.get_pos()
-
-    mouse_pos = (
-        mouse_pos[0] // SCALE,
-        mouse_pos[1] // SCALE
-    )
+    mouse_pos = screen_to_game(pygame.mouse.get_pos()) or (-1, -1)
 
     draw_menu_button(
         surface,
@@ -839,7 +858,7 @@ def draw_game(surface, pitch_control=True, state=None):
     )
 
     source = (state or {}).get("source", "starting")
-    draw_text(surface, f"{source} | D: dashboard", small_font, DARK, 8, 25)
+    draw_text(surface, f"SOURCE: {source}", small_font, DARK, 8, 25)
 
     if landing:
 
@@ -883,12 +902,7 @@ def draw_game_over(surface):
         70
     )
 
-    mouse_pos = pygame.mouse.get_pos()
-
-    mouse_pos = (
-        mouse_pos[0] // SCALE,
-        mouse_pos[1] // SCALE
-    )
+    mouse_pos = screen_to_game(pygame.mouse.get_pos()) or (-1, -1)
 
     draw_menu_button(
         surface,
@@ -946,8 +960,37 @@ def draw_calibration(surface, calibration, state):
     draw_text(surface, "ESC: return to menu", small_font, DARK, 22, 150)
 
 
+def draw_game_sidebar(surface):
+    """Frame the game with the most important controls."""
+    surface.blit(ui_title_font.render("HUMMING BIRD  /  FLIGHT", True, (225, 235, 239)),
+                 (game_rect.left, 16))
+    pygame.draw.rect(surface, (77, 218, 225), game_rect.inflate(4, 4), 2)
+    y = game_rect.bottom + 20
+    lines = (
+        "Hum higher to rise; lower to descend.",
+        "Land on a flower to rest; hum higher to leave.",
+        "SPACE: manual flap    P: pitch control",
+        "C: recalibrate    ENTER: start / retry    ESC: menu",
+    )
+    for line in lines:
+        surface.blit(ui_font.render(line, True, (190, 210, 220)), (game_rect.left, y))
+        y += 23
+    y += 8
+    surface.blit(ui_font.render("HOW TO READ THE PLOTS", True, (77, 218, 225)),
+                 (game_rect.left, y))
+    y += 22
+    for line in (
+        "Waveform: compare the input and filtered signal.",
+        "Spectrum: peaks are frequencies; white marks f0.",
+        "Spectrogram: brighter bands mean stronger tones.",
+        "Pitch track: orange smooths the cyan estimate.",
+    ):
+        surface.blit(ui_font.render(line, True, (190, 210, 220)), (game_rect.left, y))
+        y += 21
+
+
 def main(argv=None):
-    global game_state
+    global game_state, screen, game_rect, dashboard_rect
     from app.dashboard import Dashboard, handle_engine_key
 
     parser = argparse.ArgumentParser(description="Pitch-controlled Humming Bird")
@@ -963,7 +1006,8 @@ def main(argv=None):
         pitch_range = default_range(engine.mode)
         calibrated = engine.actual_source != "mic"
         pitch_control = True
-        dashboard_visible = False
+        dashboard_surface = pygame.Surface(dashboard_rect.size)
+        dashboard_elapsed = 1.0  # Draw immediately, then refresh at 15 Hz.
         after_calibration = "game"
         last_frame = None
         last_progress = time.perf_counter()
@@ -973,12 +1017,11 @@ def main(argv=None):
 
         def begin_calibration(destination):
             global game_state
-            nonlocal calibration, after_calibration, dashboard_visible
+            nonlocal calibration, after_calibration
             stop_menu_music()
             after_calibration = destination
             calibration = Calibration(engine)
             calibration.start()
-            dashboard_visible = False
             game_state = "calibration"
 
         def begin_game():
@@ -991,7 +1034,8 @@ def main(argv=None):
 
         while running:
             elapsed = clock.tick(60) / 1000.0
-            if game_state in ("menu", "how_to_play") and not dashboard_visible:
+            dashboard_elapsed += elapsed
+            if game_state in ("menu", "how_to_play"):
                 play_menu_music()
             else:
                 stop_menu_music()
@@ -1021,8 +1065,17 @@ def main(argv=None):
                 if event.type == pygame.QUIT:
                     running = False
                     continue
-                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not dashboard_visible:
-                    pos = (event.pos[0] // SCALE, event.pos[1] // SCALE)
+                if event.type == pygame.VIDEORESIZE:
+                    size = (max(MIN_WINDOW_WIDTH, event.w), max(MIN_WINDOW_HEIGHT, event.h))
+                    screen = pygame.display.set_mode(size, pygame.RESIZABLE)
+                    game_rect, dashboard_rect = layout_for_window(screen.get_size())
+                    dashboard_surface = pygame.Surface(dashboard_rect.size)
+                    dashboard_elapsed = 1.0
+                    continue
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    pos = screen_to_game(event.pos)
+                    if pos is None:
+                        continue
                     if game_state == "menu":
                         if start_button.collidepoint(pos):
                             begin_game()
@@ -1041,9 +1094,7 @@ def main(argv=None):
                     continue
                 key = event.key
                 if key == pygame.K_ESCAPE:
-                    if dashboard_visible:
-                        dashboard_visible = False
-                    elif game_state in ("game", "how_to_play", "calibration", "game_over"):
+                    if game_state in ("game", "how_to_play", "calibration", "game_over"):
                         calibration = None
                         game_state = "menu"
                     else:
@@ -1059,16 +1110,14 @@ def main(argv=None):
                         pitch_control = False
                         game_state = after_calibration
                     continue
-                if key == pygame.K_d:
-                    dashboard_visible = not dashboard_visible
-                elif key == pygame.K_c and engine.actual_source == "mic":
+                if key == pygame.K_c and engine.actual_source == "mic":
                     begin_calibration("game" if game_state == "game" else "menu")
                 elif key == pygame.K_p:
                     pitch_control = True
-                elif key == pygame.K_SPACE and game_state == "game" and not dashboard_visible:
+                elif key == pygame.K_SPACE and game_state == "game":
                     pitch_control = False
                     flap()
-                elif key == pygame.K_RETURN and not dashboard_visible:
+                elif key == pygame.K_RETURN:
                     if game_state in ("menu", "game_over"):
                         begin_game()
                     elif game_state == "how_to_play":
@@ -1089,25 +1138,30 @@ def main(argv=None):
                     calibration = None
                     game_state = after_calibration
 
-            if dashboard_visible:
-                dashboard.draw(screen, engine, state, pitch_range, pitch_control,
+            if game_state == "menu":
+                draw_menu(canvas)
+                if fallback_reason:
+                    draw_text(canvas, "MIC UNAVAILABLE - SYNTHETIC DEMO", small_font,
+                              DARK_GREEN, 65, 168)
+            elif game_state == "how_to_play":
+                draw_how_to_play(canvas)
+            elif game_state == "calibration":
+                draw_calibration(canvas, calibration, state)
+            elif game_state == "game":
+                update_game(state, pitch_range, pitch_control, dt=elapsed)
+                draw_game(canvas, pitch_control, state)
+            elif game_state == "game_over":
+                draw_game_over(canvas)
+
+            # Rendering DSP plots less often keeps audio and flight responsive.
+            if dashboard_elapsed >= 1.0 / 15.0:
+                dashboard.draw(dashboard_surface, engine, state, pitch_range, pitch_control,
                                fallback_reason, game_state)
-            else:
-                if game_state == "menu":
-                    draw_menu(canvas)
-                    if fallback_reason:
-                        draw_text(canvas, "MIC UNAVAILABLE - SYNTHETIC DEMO", small_font,
-                                  DARK_GREEN, 65, 168)
-                elif game_state == "how_to_play":
-                    draw_how_to_play(canvas)
-                elif game_state == "calibration":
-                    draw_calibration(canvas, calibration, state)
-                elif game_state == "game":
-                    update_game(state, pitch_range, pitch_control, dt=elapsed)
-                    draw_game(canvas, pitch_control, state)
-                elif game_state == "game_over":
-                    draw_game_over(canvas)
-                screen.blit(pygame.transform.scale(canvas, (WIDTH, HEIGHT)), (0, 0))
+                dashboard_elapsed %= 1.0 / 15.0
+            screen.fill((14, 22, 34))
+            draw_game_sidebar(screen)
+            screen.blit(pygame.transform.scale(canvas, game_rect.size), game_rect)
+            screen.blit(dashboard_surface, dashboard_rect)
             pygame.display.flip()
     finally:
         if engine is not None:

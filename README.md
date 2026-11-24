@@ -23,11 +23,30 @@ pitch dropouts are ignored; longer silence makes the bird fall. Land on a flower
 to stop safely, then hum higher to take off. SPACE switches to manual flapping
 (and takes off from a flower); P returns to pitch control.
 
-Press D to open the dashboard (gameplay pauses). Its key map shows the live
-controls: 1/2/3 select FFT/AMDF/ACF, W changes window, B bypasses the filter,
-M switches hum/whistle, [ and ] change frame size, N cycles injected noise, and
-C recalibrates the microphone. Escape returns to the game/menu. Synthetic and
-WAV sources use a preset pitch range and skip microphone calibration.
+The live dashboard is always visible beside the game; it does not pause play.
+Resize the window if needed. Use 1/2/3 for FFT/AMDF/ACF, W for the window,
+B to bypass the filter, M for hum/whistle mode, [ and ] for frame size, N for
+injected noise, and C to recalibrate the microphone. Escape returns to the menu.
+Synthetic and WAV sources use a preset pitch range and skip microphone calibration.
+
+## Reading the dashboard
+- **Waveform:** amplitude versus time for one frame. Cyan is the input and orange
+  is the filtered signal; compare their shapes to see the filter's effect.
+- **Spectrum:** windowed FFT magnitude versus frequency. Peaks show tones and
+  harmonics; the white marker is the estimated fundamental (f0), which need not
+  be the strongest peak. The displayed dB magnitude is unnormalized, not dBFS,
+  and changes with frame size and window.
+- **Spectrogram:** frequency versus time, with the newest column on the right.
+  Brighter colors mean greater FFT magnitude; bands can show the fundamental and
+  harmonics. The horizontal span changes with hop size and available history.
+- **Pitch track:** estimated f0 in cyan and smoothed pitch in orange, with a
+  logarithmic frequency axis. Missing cyan sections mean no estimate; the orange
+  tracker holds its last output, although the bird falls after prolonged silence.
+- **Readouts:** an open gate means signal passed the noise threshold, not that
+  pitch was detected. Confidence has a method-specific meaning, not a probability.
+  The latency budget is an estimate. The shown FFT-bin spacing is fs/N; a larger
+  frame generally increases analysis delay while providing a finer frequency grid.
+  The window affects the displayed FFT and FFT estimator, not AMDF or ACF.
 
 ## Run tests
 pytest

@@ -20,6 +20,22 @@ def wait_for(predicate, timeout=5):
     pytest.fail("Timed out waiting for the audio engine")
 
 
+class DashboardEngineStub:
+    method = "amdf"
+    window = "hann"
+    mode = "hum"
+    N = 1024
+    fs = 16000
+    bypass = False
+    noise_snr_db = None
+
+    def get_history(self):
+        return {}
+
+    def get_spectrogram(self):
+        return np.zeros((1, 1))
+
+
 def test_synthetic_engine_and_dashboard_during_live_reconfiguration(monkeypatch):
     monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
     monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
@@ -255,6 +271,106 @@ def test_game_main_handles_dashboard_and_input_headlessly(monkeypatch):
     assert not pygame.get_init()
 
 
+@pytest.mark.parametrize("size", [(960, 600), (1280, 720), (1440, 800)])
+def test_side_by_side_layout_and_mouse_mapping(size, monkeypatch):
+    game_area, dashboard_area = game.layout_for_window(size)
+    assert not game_area.colliderect(dashboard_area)
+    assert pygame.Rect((0, 0), size).contains(game_area)
+    assert pygame.Rect((0, 0), size).contains(dashboard_area)
+    monkeypatch.setattr(game, "game_rect", game_area)
+    center = game.start_button.center
+    mouse_pos = (game_area.left + (center[0] * game_area.width // game.GAME_WIDTH),
+                 game_area.top + (center[1] * game_area.height // game.GAME_HEIGHT))
+    assert game.start_button.collidepoint(game.screen_to_game(mouse_pos))
+    assert game.screen_to_game(dashboard_area.center) is None
+
+
+def test_dashboard_explanations_fit_minimum_window(monkeypatch):
+    pygame.font.init()
+    engine = DashboardEngineStub()
+    engine.actual_source = "synthetic"
+    dashboard = Dashboard()
+    captions = []
+    original = dashboard._text
+
+    def capture(surface, text, pos, color=None, font=None, max_width=None):
+        if text in ("Amplitude versus time", "Peaks: tones / harmonics; unnormalized dB",
+                    "Bands: harmonics  |  -80 to +40 dB",
+                    "Orange holds when no pitch is detected"):
+            captions.append(text)
+            assert (font or dashboard.font).size(text)[0] <= max_width
+        return original(surface, text, pos, color, font, max_width)
+
+    monkeypatch.setattr(dashboard, "_text", capture)
+    _, dashboard_area = game.layout_for_window((960, 600))
+    dashboard.draw(pygame.Surface(dashboard_area.size), engine, {}, default_range())
+    assert len(captions) == 4
+
+
+def test_spectrogram_frequency_orientation_and_color_strength():
+    pygame.font.init()
+    dashboard = Dashboard()
+    surface = pygame.Surface((320, 180))
+    engine = DashboardEngineStub()
+    engine.get_spectrogram = lambda: np.array([[40, -80], [-80, -80], [-80, 40]])
+    dashboard._spectrogram(surface, surface.get_rect(),
+                           {"spec_freqs": [0, 500, 1000], "fs": 16000, "hop": 256}, engine)
+    # The older low-frequency bin and newer high-frequency bin are bright.
+    assert sum(surface.get_at((70, 130))[:3]) > 500
+    assert sum(surface.get_at((280, 55))[:3]) > 500
+    assert sum(surface.get_at((70, 55))[:3]) < 20
+    assert sum(surface.get_at((280, 130))[:3]) < 20
+
+
+def test_game_and_dashboard_update_together_while_playing(monkeypatch):
+    monkeypatch.setenv("SDL_VIDEODRIVER", "dummy")
+    monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
+    monkeypatch.setattr(game, "MUSIC_ENABLED", False)
+    updates, draws = [], []
+    original_update, original_draw = game.update_game, Dashboard.draw
+
+    def track_update(state, pitch_range, pitch_control, dt):
+        updates.append((game.game_state, pitch_control))
+        original_update(state, pitch_range, pitch_control, dt)
+
+    def track_draw(self, surface, engine, state, *args):
+        draws.append((game.game_state, surface.get_size(), state.get("frame_id")))
+        original_draw(self, surface, engine, state, *args)
+
+    monkeypatch.setattr(game, "update_game", track_update)
+    monkeypatch.setattr(Dashboard, "draw", track_draw)
+    calls = 0
+
+    def events():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            r = game.game_rect
+            x, y = game.start_button.center
+            pos = (r.left + x * r.width // game.GAME_WIDTH,
+                   r.top + y * r.height // game.GAME_HEIGHT)
+            return [pygame.event.Event(pygame.MOUSEBUTTONDOWN, button=1, pos=pos)]
+        if calls == 2:
+            return [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_d)]
+        if calls == 3:
+            return [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_SPACE)]
+        if calls == 4:
+            return [pygame.event.Event(pygame.KEYDOWN, key=pygame.K_p)]
+        if calls == 6:
+            return [pygame.event.Event(pygame.VIDEORESIZE, w=1280, h=720, size=(1280, 720))]
+        if calls == 20:
+            return [pygame.event.Event(pygame.QUIT)]
+        return []
+
+    monkeypatch.setattr(pygame.event, "get", events)
+    game.main(["--source", "synthetic"])
+    assert len(updates) >= 19 and all(phase == "game" for phase, _ in updates)
+    assert any(not pitch for _, pitch in updates) and updates[-1][1]
+    assert len(draws) >= 2 and all(phase == "game" for phase, _, _ in draws)
+    assert len({size for _, size, _ in draws}) == 2
+    assert len({frame for _, _, frame in draws if frame is not None}) >= 2
+
+
 def test_rebuild_keeps_changes_requested_during_pipeline_setup(monkeypatch):
     from app import audio_io
 
@@ -299,7 +415,7 @@ def test_stalled_microphone_switches_to_synthetic(monkeypatch):
     monkeypatch.setattr(game, "MUSIC_ENABLED", False)
     instances = []
 
-    class FakeEngine:
+    class FakeEngine(DashboardEngineStub):
         def __init__(self, source, **kwargs):
             self.actual_source = source
             self.method = kwargs.get("method", "amdf")
@@ -349,7 +465,7 @@ def test_game_runs_guided_microphone_calibration(monkeypatch):
     monkeypatch.setenv("SDL_AUDIODRIVER", "dummy")
     monkeypatch.setattr(game, "MUSIC_ENABLED", False)
 
-    class FakeEngine:
+    class FakeEngine(DashboardEngineStub):
         actual_source = "mic"
         mode = "hum"
         last_error = None
