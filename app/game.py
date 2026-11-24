@@ -1,12 +1,15 @@
-import pygame
-import random
-import sys
+import argparse
 import math
 import os
-import wave
+import random
 import struct
+import time
+import wave
 
-pygame.init()
+import pygame
+
+from app.audio_io import PitchEngine
+from app.calibration import Calibration, default_range
 
 # --------------------------------------------------
 # GAME WINDOW
@@ -19,12 +22,9 @@ GAME_WIDTH = 320
 GAME_HEIGHT = 180
 SCALE = 3
 
-screen = pygame.display.set_mode((WIDTH, HEIGHT))
-pygame.display.set_caption("Humming Bird - Flower Adventure")
-
-canvas = pygame.Surface((GAME_WIDTH, GAME_HEIGHT))
-
-clock = pygame.time.Clock()
+screen = None
+canvas = None
+clock = None
 
 # --------------------------------------------------
 # MENU MUSIC
@@ -108,11 +108,21 @@ def stop_menu_music():
     if pygame.mixer.get_init():
         pygame.mixer.music.stop()
 
-# Pixel-style fonts
-title_font = pygame.font.Font(None, 30)
-medium_font = pygame.font.Font(None, 18)
-small_font = pygame.font.Font(None, 12)
-how_to_font = pygame.font.Font(None, 16)
+# Initialized by main() so importing game logic does not open a window.
+title_font = medium_font = small_font = how_to_font = None
+
+
+def initialize_display():
+    global screen, canvas, clock, title_font, medium_font, small_font, how_to_font
+    pygame.init()
+    screen = pygame.display.set_mode((WIDTH, HEIGHT))
+    pygame.display.set_caption("Humming Bird - Flower Adventure")
+    canvas = pygame.Surface((GAME_WIDTH, GAME_HEIGHT))
+    clock = pygame.time.Clock()
+    title_font = pygame.font.Font(None, 30)
+    medium_font = pygame.font.Font(None, 18)
+    small_font = pygame.font.Font(None, 12)
+    how_to_font = pygame.font.Font(None, 16)
 
 # --------------------------------------------------
 # COLOURS
@@ -149,30 +159,48 @@ game_state = "menu"
 bird_x = 85
 bird_y = 100
 
-bird_velocity = 0
+# Positions are in game pixels, velocities in pixels per second.
+bird_velocity = 0.0
+GRAVITY = 324.0
+FLAP_STRENGTH = -126.0
+MAX_RISE_SPEED = 125.0
+MAX_FALL_SPEED = 145.0
+PITCH_STIFFNESS = 100.0
+PITCH_DAMPING = 20.0
+PITCH_LIFT = 850.0
+PITCH_DROP = 700.0
+PITCH_GRACE_SECONDS = 0.25
+MIN_REST_SECONDS = 0.35
+TAKEOFF_DISTANCE = 12.0
+MAX_STEP_SECONDS = 1.0 / 60.0
+MAX_FRAME_SECONDS = 0.1
 
-GRAVITY = 0.09
-FLAP_STRENGTH = -2.1
+bird_width = 15
+bird_height = 9
 
-bird_width = 9
-bird_height = 8
-
-bird_animation = 0
+bird_animation = 0.0
+pitch_target = None
+pitch_silence_seconds = 0.0
 
 # --------------------------------------------------
 # GAME SETTINGS
 # --------------------------------------------------
 
 score = 0
+gaps_passed = 0
 
-game_speed = 0.65
+game_speed = 45.0  # world pixels per second
 
 ground_y = 166
 
-camera_x = 0
+camera_x = 0.0
 
 landing = False
-landing_timer = 0
+landing_timer = 0.0
+walls = []
+WALL_WIDTH = 28
+WALL_GAP = 72
+WALL_SPACING = 190
 
 # --------------------------------------------------
 # FLOWERS
@@ -198,36 +226,19 @@ def create_flowers():
 
     flowers = []
 
-    flowers.append(create_flower(100, 140))
-    flowers.append(create_flower(190, 115))
-    flowers.append(create_flower(280, 135))
-    flowers.append(create_flower(370, 105))
-    flowers.append(create_flower(460, 130))
-    flowers.append(create_flower(550, 95))
-    flowers.append(create_flower(640, 125))
+    flowers.append(create_flower(170, 135))
+    flowers.append(create_flower(300, 120))
+    flowers.append(create_flower(495, 130))
 
 
-# --------------------------------------------------
-# BEES
-# --------------------------------------------------
+# Walls are separated by flowers so a resting bird is always safe.
+def create_wall(x):
+    return {"x": x, "gap_top": random.randint(38, 76), "passed": False}
 
-bees = []
 
-def create_bees():
-
-    global bees
-
-    bees = []
-
-    for i in range(4):
-
-        bees.append({
-            "x": 220 + i * 140,
-            "y": random.randint(45, 110),
-            "start_y": random.randint(45, 110),
-            "direction": -1,
-            "wing": 0
-        })
+def create_walls():
+    global walls
+    walls = [create_wall(400)]
 
 
 # --------------------------------------------------
@@ -281,8 +292,19 @@ def draw_ground(surface):
 
 
 # --------------------------------------------------
-# DRAW FLOWERS
+# DRAW WALLS AND FLOWERS
 # --------------------------------------------------
+
+def draw_wall(surface, wall):
+    x = int(wall["x"] - camera_x)
+    gap_top = wall["gap_top"]
+    gap_bottom = gap_top + WALL_GAP
+    for top, height in ((0, gap_top), (gap_bottom, ground_y - gap_bottom)):
+        pygame.draw.rect(surface, DARK_GREEN, (x, top, WALL_WIDTH, height))
+        pygame.draw.rect(surface, GREEN, (x + 3, top, WALL_WIDTH - 6, height))
+    pygame.draw.rect(surface, DARK_GREEN, (x - 2, gap_top - 5, WALL_WIDTH + 4, 5))
+    pygame.draw.rect(surface, DARK_GREEN, (x - 2, gap_bottom, WALL_WIDTH + 4, 5))
+
 
 def draw_flower(surface, flower):
 
@@ -358,7 +380,7 @@ def draw_bird(surface, x=None, y=None):
     )
 
     # Wing animation
-    wing_offset = 2 if bird_animation % 2 == 0 else -2
+    wing_offset = 2 if int(bird_animation * 10) % 2 == 0 else -2
 
     pygame.draw.rect(
         surface,
@@ -450,29 +472,21 @@ def draw_bee(surface, bee):
 # --------------------------------------------------
 
 def reset_game():
+    global bird_y, bird_velocity, bird_animation, score, gaps_passed, camera_x
+    global landing, landing_timer, game_speed, pitch_target, pitch_silence_seconds
 
-    global bird_y
-    global bird_velocity
-    global score
-    global camera_x
-    global landing
-    global landing_timer
-    global game_speed
-
-    bird_y = 100
-    bird_velocity = 0
-
-    score = 0
-
-    camera_x = 0
-
+    bird_y = 100.0
+    bird_velocity = 0.0
+    bird_animation = 0.0
+    score = gaps_passed = 0
+    camera_x = 0.0
     landing = False
-    landing_timer = 0
-
-    game_speed = 0.65
-
+    landing_timer = 0.0
+    pitch_target = None
+    pitch_silence_seconds = 0.0
+    game_speed = 45.0
     create_flowers()
-    create_bees()
+    create_walls()
 
 
 
@@ -639,11 +653,11 @@ def draw_how_to_play(surface):
     )
 
     instructions = [
-        "1. Help your bird fly!",
-        "2. Press SPACE to flap.",
-        "3. Land on colourful flowers.",
-        "4. Avoid the buzzing bees!",
-        "5. Collect points by reaching flowers."
+        "1. Hum higher to rise; lower to descend.",
+        "2. Fly through gaps; silence makes you fall.",
+        "3. Rest on flowers; hum higher to take off.",
+        "4. SPACE: manual flap; P: pitch control.",
+        "5. D: dashboard, C: calibrate, ESC: back."
     ]
 
     for i, instruction in enumerate(instructions):
@@ -675,197 +689,128 @@ def draw_how_to_play(surface):
 # COLLISION DETECTION
 # --------------------------------------------------
 
-def check_bee_collision(bee):
-
-    bird_rect = pygame.Rect(
-        bird_x,
-        bird_y,
-        bird_width + 7,
-        bird_height
-    )
-
-    bee_rect = pygame.Rect(
-        bee["x"] - camera_x,
-        bee["y"],
-        16,
-        8
-    )
-
-    return bird_rect.colliderect(bee_rect)
+def check_wall_collision(wall):
+    left = wall["x"] - camera_x - 2
+    right = wall["x"] - camera_x + WALL_WIDTH + 2
+    bird_left = bird_x + 1
+    bird_right = bird_x + bird_width - 1
+    return (bird_right > left and bird_left < right
+            and (bird_y - 3 < wall["gap_top"]
+                 or bird_y + bird_height > wall["gap_top"] + WALL_GAP))
 
 
 # --------------------------------------------------
 # GAME UPDATE
 # --------------------------------------------------
 
-def update_game():
+def flap():
+    """Take off or flap using the manual fallback."""
+    global bird_velocity, landing, landing_timer
+    landing = False
+    landing_timer = 0.0
+    bird_velocity = FLAP_STRENGTH
 
-    global bird_y
-    global bird_velocity
-    global camera_x
-    global score
-    global landing
-    global landing_timer
-    global game_state
-    global bird_animation
-    global game_speed
 
-    bird_animation += 1
+def update_game(state=None, pitch_range=None, pitch_control=False, dt=1.0 / 60.0):
+    """Advance flight using elapsed seconds and bounded physics steps."""
+    remaining = min(max(0.0, dt), MAX_FRAME_SECONDS)
+    while remaining > 1e-9 and game_state == "game":
+        step = min(remaining, MAX_STEP_SECONDS)
+        _update_game_step(state or {}, pitch_range, pitch_control, step)
+        remaining -= step
 
-    # --------------------------------------------------
-    # LANDING ON A FLOWER
-    # --------------------------------------------------
+
+def _update_game_step(state, pitch_range, pitch_control, dt):
+    global bird_y, bird_velocity, bird_animation, camera_x, score, gaps_passed
+    global landing, landing_timer, game_state, pitch_target, pitch_silence_seconds
+
+    bird_animation += dt
+    semitone = state.get("semitone")
+    voiced = (pitch_control and pitch_range is not None and semitone is not None
+              and math.isfinite(semitone) and state.get("gate_open", True)
+              and state.get("f0", 1) is not None and not state.get("calibrating"))
+    if voiced:
+        pitch_target = pitch_range.height(semitone, 14, ground_y - bird_height - 12)
+        pitch_silence_seconds = 0.0
+    else:
+        pitch_silence_seconds += dt
 
     if landing:
-
-        landing_timer += 1
-
-        bird_velocity = 0
-
-        if landing_timer > 35:
-
+        landing_timer += dt
+        bird_velocity = 0.0
+        if (voiced and landing_timer >= MIN_REST_SECONDS
+                and pitch_target <= bird_y - TAKEOFF_DISTANCE):
             landing = False
-            landing_timer = 0
+            landing_timer = 0.0
+        else:
+            return  # The bird, world, and hazards remain stationary and safe.
 
-            bird_velocity = FLAP_STRENGTH
+    previous_bottom = bird_y + bird_height
+    previous_camera = camera_x
+    acceleration = GRAVITY
+    if pitch_control and pitch_target is not None and pitch_silence_seconds <= PITCH_GRACE_SECONDS:
+        # A damped spring follows pitch without teleporting; gravity remains active.
+        lift = (PITCH_STIFFNESS * (pitch_target - bird_y)
+                - PITCH_DAMPING * bird_velocity - GRAVITY)
+        acceleration += max(-PITCH_LIFT, min(PITCH_DROP, lift))
+    bird_velocity = max(-MAX_RISE_SPEED, min(MAX_FALL_SPEED, bird_velocity + acceleration * dt))
+    bird_y += bird_velocity * dt
+    camera_x += game_speed * dt
 
+    # A descending bird lands at the visible petal tops. Sweep the crossing
+    # horizontally as well as vertically so a frame-rate change cannot miss it.
+    bird_bottom = bird_y + bird_height
+    if bird_velocity > 0 and bird_bottom > previous_bottom:
+        for flower in flowers:
+            flower_top = flower["y"] - 5
+            if previous_bottom <= flower_top <= bird_bottom:
+                fraction = (flower_top - previous_bottom) / (bird_bottom - previous_bottom)
+                world_x = bird_x + previous_camera + (camera_x - previous_camera) * fraction
+                if world_x + bird_width > flower["x"] + 3 and world_x < flower["x"] + 28:
+                    bird_y = flower_top - bird_height
+                    bird_velocity = 0.0
+                    landing = True
+                    landing_timer = 0.0
+                    if not flower.get("visited"):
+                        flower["visited"] = True
+                        score += 1
+                    return
+
+    for wall in walls:
+        if check_wall_collision(wall):
+            game_state = "game_over"
+            return
+        if not wall["passed"] and bird_x + camera_x > wall["x"] + WALL_WIDTH + 2:
+            wall["passed"] = True
+            gaps_passed += 1
+
+    if bird_y - 4 < 0 or bird_y + bird_height >= ground_y:
+        game_state = "game_over"
         return
 
-    # --------------------------------------------------
-    # BIRD MOVEMENT
-    # --------------------------------------------------
-
-    bird_velocity += GRAVITY
-
-    bird_y += bird_velocity
-
-    # --------------------------------------------------
-    # WORLD MOVEMENT
-    # --------------------------------------------------
-
-    camera_x += game_speed
-
-    # --------------------------------------------------
-    # FLOWER COLLISION
-    # --------------------------------------------------
-
-    bird_world_x = bird_x + camera_x
-
-    for flower in flowers:
-
-        flower_left = flower["x"] + 3
-        flower_right = flower["x"] + 26
-
-        bird_left = bird_world_x
-        bird_right = bird_world_x + bird_width
-
-        flower_top = flower["y"] - 1
-
-        bird_bottom = bird_y + bird_height
-
-        if (
-            bird_right > flower_left
-            and bird_left < flower_right
-            and bird_velocity > 0
-            and bird_bottom >= flower_top
-            and bird_bottom <= flower_top + 5
-        ):
-
-            bird_y = flower_top - bird_height
-
-            bird_velocity = 0
-
-            landing = True
-            landing_timer = 0
-
-            score += 1
-
-            break
-
-    # --------------------------------------------------
-    # BEE MOVEMENT
-    # --------------------------------------------------
-
-    for bee in bees:
-
-        bee["x"] += bee["direction"] * 0.7
-
-        bee["y"] = bee["start_y"] + math.sin(
-            pygame.time.get_ticks() / 250 + bee["x"]
-        ) * 7
-
-        bee["wing"] += 1
-
-
-        if check_bee_collision(bee):
-
-            game_state = "game_over"
-
-    # --------------------------------------------------
-    # ADD NEW FLOWERS
-    # --------------------------------------------------
-
-    if flowers[-1]["x"] - camera_x < 300:
-
-        last_x = flowers[-1]["x"]
-
-        new_y = random.randint(85, 140)
-
-        flowers.append(
-            create_flower(last_x + random.randint(75, 100), new_y)
-        )
-
-    # --------------------------------------------------
-    # ADD NEW BEES
-    # --------------------------------------------------
-
-    if bees[-1]["x"] - camera_x < 280:
-
-        bees.append({
-            "x": camera_x + 350,
-            "y": random.randint(45, 110),
-            "start_y": random.randint(45, 110),
-            "direction": -1,
-            "wing": 0
-        })
-
-    # Remove old objects
-    flowers[:] = [
-        flower for flower in flowers
-        if flower["x"] - camera_x > -50
-    ]
-
-    bees[:] = [
-        bee for bee in bees
-        if bee["x"] - camera_x > -30
-    ]
-
-    # --------------------------------------------------
-    # GAME OVER CONDITIONS
-    # --------------------------------------------------
-
-    if bird_y > ground_y - bird_height or bird_y < 0:
-
-        game_state = "game_over"
+    # Keep a wall and a flower between successive walls available ahead.
+    if walls:
+        while walls[-1]["x"] - camera_x < GAME_WIDTH + 220:
+            next_x = walls[-1]["x"] + WALL_SPACING
+            walls.append(create_wall(next_x))
+            flowers.append(create_flower(next_x + 95, random.randint(105, 140)))
+    walls[:] = [wall for wall in walls if wall["x"] - camera_x > -WALL_WIDTH - 5]
+    flowers[:] = [flower for flower in flowers if flower["x"] - camera_x > -30]
 
 
 # --------------------------------------------------
 # DRAW GAME
 # --------------------------------------------------
 
-def draw_game(surface):
+def draw_game(surface, pitch_control=True, state=None):
 
     draw_background(surface)
 
-    # Flowers
+    for wall in walls:
+        draw_wall(surface, wall)
+
     for flower in flowers:
         draw_flower(surface, flower)
-
-    # Bees
-    for bee in bees:
-        game_bee = bee.copy()
-        game_bee["x"] = bee["x"] - camera_x
-        draw_bee(surface, game_bee)
 
     # Bird
     draw_bird(surface)
@@ -876,7 +821,7 @@ def draw_game(surface):
     # Score
     draw_text(
         surface,
-        "FLOWERS: " + str(score),
+        f"GAPS: {gaps_passed}  FLOWERS: {score}",
         medium_font,
         DARK,
         8,
@@ -886,22 +831,25 @@ def draw_game(surface):
     # Instructions
     draw_text(
         surface,
-        "SPACE: FLAP",
+        "PITCH" if pitch_control else "MANUAL: SPACE",
         small_font,
         DARK,
         235,
         10
     )
 
+    source = (state or {}).get("source", "starting")
+    draw_text(surface, f"{source} | D: dashboard", small_font, DARK, 8, 25)
+
     if landing:
 
         draw_text(
             surface,
-            "RESTING...",
+            "RESTING: HUM HIGHER OR SPACE",
             small_font,
             DARK_GREEN,
-            130,
-            30
+            95,
+            40
         )
 
 
@@ -928,7 +876,7 @@ def draw_game_over(surface):
 
     draw_text(
         surface,
-        "FLOWERS REACHED: " + str(score),
+        f"GAPS: {gaps_passed}   FLOWERS: {score}",
         medium_font,
         DARK_GREEN,
         90,
@@ -960,149 +908,219 @@ def draw_game_over(surface):
 # MAIN GAME LOOP
 # --------------------------------------------------
 
-running = True
+def start_audio(source="mic", device=None):
+    """Start the requested source, falling back to a demo if the mic fails."""
+    engine = PitchEngine(source=source, device=device)
+    try:
+        engine.start()
+        return engine, None
+    except Exception as exc:
+        engine.stop()
+        if source != "mic":
+            raise
+        fallback = PitchEngine(source="synthetic")
+        fallback.start()
+        return fallback, str(exc)
 
-reset_game()
 
-while running:
+def draw_calibration(surface, calibration, state):
+    draw_background(surface)
+    draw_text(surface, "CALIBRATION", title_font, DARK, 90, 16)
+    lines = []
+    line = ""
+    for word in calibration.message.split():
+        candidate = f"{line} {word}".strip()
+        if small_font.size(candidate)[0] > 275 and line:
+            lines.append(line)
+            line = word
+        else:
+            line = candidate
+    lines.append(line)
+    for index, line in enumerate(lines):
+        draw_text(surface, line, small_font, DARK, 22, 58 + index * 13)
+    note = state.get("note") or "--"
+    draw_text(surface, f"Current note: {note}   Gate: "
+              f"{'OPEN' if state.get('gate_open') else 'CLOSED'}",
+              small_font, DARK_GREEN, 22, 100)
+    draw_text(surface, "SPACE: skip and use manual control", small_font, DARK, 22, 135)
+    draw_text(surface, "ESC: return to menu", small_font, DARK, 22, 150)
 
-    clock.tick(60)
 
-    # Play music on menu and how-to screens
-    if game_state in ("menu", "how_to_play"):
+def main(argv=None):
+    global game_state, bird_velocity
+    from app.dashboard import Dashboard, handle_engine_key
 
-        play_menu_music()
+    parser = argparse.ArgumentParser(description="Pitch-controlled Humming Bird")
+    parser.add_argument("--source", default="mic", help="mic, synthetic, or a WAV file")
+    parser.add_argument("--device", type=int, default=None, help="microphone device index")
+    args = parser.parse_args(argv)
+    initialize_display()
+    engine = None
+    try:
+        engine, fallback_reason = start_audio(args.source, args.device)
+        dashboard = Dashboard()
+        calibration = None
+        pitch_range = default_range(engine.mode)
+        calibrated = engine.actual_source != "mic"
+        pitch_control = True
+        dashboard_visible = False
+        after_calibration = "game"
+        last_frame = None
+        last_progress = time.perf_counter()
+        running = True
+        game_state = "menu"
+        reset_game()
 
-    else:
+        def begin_calibration(destination):
+            global game_state
+            nonlocal calibration, after_calibration, dashboard_visible
+            stop_menu_music()
+            after_calibration = destination
+            calibration = Calibration(engine)
+            calibration.start()
+            dashboard_visible = False
+            game_state = "calibration"
 
-        stop_menu_music()
+        def begin_game():
+            global game_state
+            reset_game()
+            if engine.actual_source == "mic" and not calibrated:
+                begin_calibration("game")
+            else:
+                game_state = "game"
 
-    for event in pygame.event.get():
+        while running:
+            elapsed = clock.tick(60) / 1000.0
+            if game_state in ("menu", "how_to_play") and not dashboard_visible:
+                play_menu_music()
+            else:
+                stop_menu_music()
 
-        if event.type == pygame.QUIT:
+            state = engine.get_state()
+            frame = state.get("frame_id")
+            if frame is not None and frame != last_frame:
+                last_frame, last_progress = frame, time.perf_counter()
+            if engine.actual_source == "mic" and time.perf_counter() - last_progress > 3.0:
+                fallback_reason = engine.last_error or "Microphone stopped producing audio."
+                old = engine
+                engine = PitchEngine(source="synthetic", method=old.method,
+                                     window=old.window, mode=old.mode, N=old.N)
+                engine.set_bypass(old.bypass)
+                engine.set_noise_snr(old.noise_snr_db)
+                old.stop()
+                engine.start()
+                state = engine.get_state()
+                pitch_range = default_range(engine.mode)
+                calibrated = True
+                if game_state == "calibration":
+                    calibration = None
+                    game_state = after_calibration
+                last_frame, last_progress = None, time.perf_counter()
 
-            running = False
-
-        # ------------------------------------------
-        # MOUSE BUTTONS
-        # ------------------------------------------
-
-        if event.type == pygame.MOUSEBUTTONDOWN:
-
-            if event.button == 1:
-
-                mouse_pos = (
-                    event.pos[0] // SCALE,
-                    event.pos[1] // SCALE
-                )
-
-                if game_state == "menu":
-
-                    if start_button.collidepoint(mouse_pos):
-
-                        reset_game()
-                        game_state = "game"
-
-                    elif how_button.collidepoint(mouse_pos):
-
-                        game_state = "how_to_play"
-
-                    elif quit_button.collidepoint(mouse_pos):
-
-                        running = False
-
-                elif game_state == "how_to_play":
-
-                    if back_button.collidepoint(mouse_pos):
-
-                        game_state = "menu"
-
-                elif game_state == "game_over":
-
-                    if retry_button.collidepoint(mouse_pos):
-
-                        reset_game()
-                        game_state = "game"
-
-                    elif game_over_menu_button.collidepoint(mouse_pos):
-
-                        game_state = "menu"
-
-        # ------------------------------------------
-        # KEYBOARD CONTROLS
-        # ------------------------------------------
-
-        if event.type == pygame.KEYDOWN:
-
-            if event.key == pygame.K_ESCAPE:
-
-                if game_state == "game":
-
-                    game_state = "menu"
-
-                elif game_state == "how_to_play":
-
-                    game_state = "menu"
-
-                else:
-
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT:
                     running = False
+                    continue
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1 and not dashboard_visible:
+                    pos = (event.pos[0] // SCALE, event.pos[1] // SCALE)
+                    if game_state == "menu":
+                        if start_button.collidepoint(pos):
+                            begin_game()
+                        elif how_button.collidepoint(pos):
+                            game_state = "how_to_play"
+                        elif quit_button.collidepoint(pos):
+                            running = False
+                    elif game_state == "how_to_play" and back_button.collidepoint(pos):
+                        game_state = "menu"
+                    elif game_state == "game_over":
+                        if retry_button.collidepoint(pos):
+                            begin_game()
+                        elif game_over_menu_button.collidepoint(pos):
+                            game_state = "menu"
+                if event.type != pygame.KEYDOWN:
+                    continue
+                key = event.key
+                if key == pygame.K_ESCAPE:
+                    if dashboard_visible:
+                        dashboard_visible = False
+                    elif game_state in ("game", "how_to_play", "calibration", "game_over"):
+                        calibration = None
+                        game_state = "menu"
+                    else:
+                        running = False
+                    continue
+                if game_state == "calibration":
+                    if key == pygame.K_RETURN:
+                        calibration.record_note(state)
+                    elif key == pygame.K_SPACE:
+                        calibration = None
+                        pitch_range = default_range(engine.mode)
+                        calibrated = False
+                        pitch_control = False
+                        game_state = after_calibration
+                    continue
+                if key == pygame.K_d:
+                    dashboard_visible = not dashboard_visible
+                elif key == pygame.K_c and engine.actual_source == "mic":
+                    begin_calibration("game" if game_state == "game" else "menu")
+                elif key == pygame.K_p:
+                    pitch_control = True
+                elif key == pygame.K_SPACE and game_state == "game" and not dashboard_visible:
+                    pitch_control = False
+                    if not landing:
+                        bird_velocity = FLAP_STRENGTH
+                elif key == pygame.K_RETURN and not dashboard_visible:
+                    if game_state in ("menu", "game_over"):
+                        begin_game()
+                    elif game_state == "how_to_play":
+                        game_state = "menu"
+                else:
+                    changed = handle_engine_key(engine, key)
+                    if changed == "mode":
+                        pitch_range = default_range(engine.mode)
+                        calibrated = engine.actual_source != "mic"
+                        if not calibrated and game_state == "game":
+                            begin_calibration("game")
 
-            if event.key == pygame.K_RETURN:
+            if game_state == "calibration" and calibration is not None:
+                if calibration.update(state) == "done":
+                    pitch_range = calibration.pitch_range
+                    calibrated = True
+                    pitch_control = True
+                    calibration = None
+                    game_state = after_calibration
 
+            if dashboard_visible:
+                dashboard.draw(screen, engine, state, pitch_range, pitch_control,
+                               fallback_reason, game_state)
+            else:
                 if game_state == "menu":
-
-                    reset_game()
-                    game_state = "game"
-
-                elif game_state == "game_over":
-
-                    reset_game()
-                    game_state = "game"
-
+                    draw_menu(canvas)
+                    if fallback_reason:
+                        draw_text(canvas, "MIC UNAVAILABLE - SYNTHETIC DEMO", small_font,
+                                  DARK_GREEN, 65, 168)
                 elif game_state == "how_to_play":
-
-                    game_state = "menu"
-
-            if event.key == pygame.K_SPACE:
-
-                if game_state == "game" and not landing:
-
-                    bird_velocity = FLAP_STRENGTH
-
-    # ----------------------------------------------
-    # UPDATE AND DRAW
-    # ----------------------------------------------
-
-    if game_state == "menu":
-
-        draw_menu(canvas)
-
-    elif game_state == "how_to_play":
-
-        draw_how_to_play(canvas)
-
-    elif game_state == "game":
-
-        update_game()
-        draw_game(canvas)
-
-    elif game_state == "game_over":
-
-        draw_game_over(canvas)
-
-    # Enlarge pixel-art screen
-    enlarged = pygame.transform.scale(
-        canvas,
-        (WIDTH, HEIGHT)
-    )
-
-    screen.blit(enlarged, (0, 0))
-
-    pygame.display.flip()
+                    draw_how_to_play(canvas)
+                elif game_state == "calibration":
+                    draw_calibration(canvas, calibration, state)
+                elif game_state == "game":
+                    update_game(state, pitch_range, pitch_control)
+                    draw_game(canvas, pitch_control, state)
+                elif game_state == "game_over":
+                    draw_game_over(canvas)
+                screen.blit(pygame.transform.scale(canvas, (WIDTH, HEIGHT)), (0, 0))
+            pygame.display.flip()
+    finally:
+        if engine is not None:
+            engine.stop()
+        stop_menu_music()
+        pygame.quit()
 
 
-stop_menu_music()
+if __name__ == "__main__":
+    main()
 
-pygame.quit()
-sys.exit()
+
+
+
+

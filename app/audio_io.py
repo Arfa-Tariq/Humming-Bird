@@ -18,6 +18,7 @@ import argparse
 import threading
 import time
 from collections import deque
+from itertools import chain
 from math import gcd
 
 import numpy as np
@@ -107,12 +108,14 @@ class PitchEngine:
     def set_mode(self, mode):
         if mode not in MODES:
             raise ValueError(f"mode must be one of {list(MODES)}")
-        self.mode = mode
-        self._rebuild = True
+        with self._lock:
+            self.mode = mode
+            self._rebuild = True
 
     def set_frame_size(self, N):
-        self.N = int(N)
-        self._rebuild = True
+        with self._lock:
+            self.N = int(N)
+            self._rebuild = True
 
     def set_noise_snr(self, snr_db):
         """None turns injection off. Noise is scaled to each block's own RMS, so
@@ -121,9 +124,13 @@ class PitchEngine:
 
     def calibrate_noise(self, seconds=1.5):
         """Stay quiet: measures the room and sets T_off = mean(RMS) + 3 std(RMS)."""
-        self._cal_rms = []
-        self._cal_until = time.perf_counter() + seconds
-        self._cal_active = True
+        with self._lock:
+            self.noise_calibrated = False
+            self._cal_rms = []
+            self._cal_until = time.perf_counter() + seconds
+            self._cal_active = True
+            self._state = dict(self._state, calibrating=True, noise_calibrated=False,
+                               gate_open=False)
 
     def estimated_latency_ms(self):
         """Latency budget formula from the guide (Section 12)."""
@@ -155,7 +162,9 @@ class PitchEngine:
         elif self.source == "synthetic":
             fs_in, factor, feeder = TARGET_FS, 1, self._synthetic_blocks()
         else:
-            fs_in, factor, feeder = TARGET_FS, 1, self._file_blocks(self.source)
+            blocks = self._file_blocks(self.source)
+            first_block = next(blocks)  # Open and validate the WAV before starting threads.
+            fs_in, factor, feeder = TARGET_FS, 1, chain((first_block,), blocks)
         self.actual_source = self.source
 
         self._dec = StreamingDecimator(fs_in, factor) if factor > 1 else None
@@ -180,6 +189,9 @@ class PitchEngine:
         if self._stream is not None:
             try:
                 self._stream.stop()
+            except Exception:
+                pass
+            try:
                 self._stream.close()
             except Exception:
                 pass
@@ -238,7 +250,8 @@ class PitchEngine:
         period = 10.0
         while True:
             t = (n + np.arange(BLOCK)) / TARGET_FS
-            f = 200.0 * 2.0 ** np.sin(2 * np.pi * t / period)
+            center = 1200.0 if self.mode == "whistle" else 200.0
+            f = center * 2.0 ** np.sin(2 * np.pi * t / period)
             ph = phase + np.cumsum(2 * np.pi * f / TARGET_FS)
             phase = float(ph[-1] % (2 * np.pi))
             x = sum(np.sin(k * ph) / k for k in range(1, 5)) * 0.15
@@ -252,10 +265,15 @@ class PitchEngine:
         from scipy.signal import resample_poly
         rate, data = wavfile.read(path)
         x = data.astype(float)
-        if np.issubdtype(data.dtype, np.integer):
+        if np.issubdtype(data.dtype, np.unsignedinteger):
+            midpoint = (float(np.iinfo(data.dtype).max) + 1.0) / 2.0
+            x = (x - midpoint) / midpoint
+        elif np.issubdtype(data.dtype, np.integer):
             x /= float(np.iinfo(data.dtype).max)
         if x.ndim > 1:
             x = x.mean(axis=1)
+        if x.size == 0:
+            raise ValueError("WAV file contains no samples.")
         if rate != TARGET_FS:
             g = gcd(int(rate), TARGET_FS)
             x = resample_poly(x, TARGET_FS // g, int(rate) // g)
@@ -269,20 +287,25 @@ class PitchEngine:
     # worker thread
     # ------------------------------------------------------------------
     def _setup_pipeline(self):
-        cfg = MODES[self.mode]
+        with self._lock:
+            mode, N = self.mode, self.N
+        cfg = MODES[mode]
         self._bp = StreamingBandpass(self.fs, cfg["f_lo"], cfg["f_hi"],
                                      order=self.bp_order, kind=self.bp_kind)
         self._fmin, self._fmax = cfg["fmin"], cfg["fmax"]
-        self._N = int(self.N)
+        self._N = int(N)
+        self._pipeline_mode = mode
         self._hop = self._N // 4
         self._raw = np.zeros(0)
         self._filt = np.zeros(0)
         freqs = np.fft.rfftfreq(self._N, 1.0 / self.fs)
         self._disp_mask = freqs <= cfg["disp"]
         self._disp_freqs = freqs[self._disp_mask]
-        self._spec_cols.clear()
         self.tracker.reset()
-        self._rebuild = False
+        with self._lock:
+            self._spec_cols.clear()
+            # Keep a later UI change pending if it arrived during the rebuild.
+            self._rebuild = self.mode != mode or self.N != N
 
     def _worker(self):
         while not self._stop.is_set():
@@ -328,17 +351,19 @@ class PitchEngine:
         frame = raw if self.bypass else filt
         rms = float(np.sqrt(np.mean(frame ** 2)))
 
-        if self._cal_active:
-            self._cal_rms.append(rms)
-            if time.perf_counter() >= self._cal_until:
-                r = np.array(self._cal_rms)
-                self.gate.noise_floor = float(r.mean() + 3.0 * r.std())
-                self.gate.is_open = False
-                self._cal_active = False
-                self.noise_calibrated = True
+        with self._lock:
+            if self._cal_active:
+                self._cal_rms.append(rms)
+                if time.perf_counter() >= self._cal_until:
+                    r = np.array(self._cal_rms)
+                    self.gate.noise_floor = float(r.mean() + 3.0 * r.std())
+                    self.gate.is_open = False
+                    self._cal_active = False
+                    self.noise_calibrated = True
+            calibrating = self._cal_active
 
         self.gate.process(frame)
-        gate_open = self.gate.is_open and not self._cal_active
+        gate_open = self.gate.is_open and not calibrating
 
         f0, info = None, None
         if gate_open:
@@ -349,13 +374,11 @@ class PitchEngine:
         note, cents = hz_to_note(f0)
 
         # one spectrogram column per analysis hop (not per drawn frame)
-        spec = np.abs(np.fft.rfft((filt - filt.mean()) * get_window(self.window, N)))
+        spec = np.abs(np.fft.rfft((frame - frame.mean()) * get_window(self.window, N)))
         spec_db = 20.0 * np.log10(spec[self._disp_mask] + 1e-9)
-        self._spec_cols.append(spec_db.astype(np.float32))
 
         now = time.perf_counter()
         self._frame_id += 1
-        self._hist.append((now, np.nan if f0 is None else f0, smooth_hz, gate_open))
 
         state = {
             "running": True,
@@ -373,7 +396,7 @@ class PitchEngine:
             "noise_floor": self.gate.noise_floor,
             "method": self.method,
             "window": self.window,
-            "mode": self.mode,
+            "mode": self._pipeline_mode,
             "bypass": self.bypass,
             "noise_snr_db": self.noise_snr_db,
             "N": N, "hop": hop, "fs": self.fs,
@@ -387,6 +410,15 @@ class PitchEngine:
             "error": self.last_error,
         }
         with self._lock:
+            # Calibration may have been requested while this frame was analysed.
+            state["calibrating"] = self._cal_active
+            state["noise_calibrated"] = self.noise_calibrated
+            if self._cal_active:
+                state.update(gate_open=False, f0=None, confidence=0.0,
+                             note=None, cents=float("nan"))
+            self._spec_cols.append(spec_db.astype(np.float32))
+            self._hist.append((now, np.nan if state["f0"] is None else state["f0"],
+                               smooth_hz, state["gate_open"]))
             self._state = state
 
     # ------------------------------------------------------------------
@@ -399,7 +431,8 @@ class PitchEngine:
     def get_history(self):
         """Arrays for the pitch-track panel: t (s, relative to now), f0 Hz (nan
         when rejected), smoothed Hz, gate state."""
-        h = list(self._hist)
+        with self._lock:
+            h = list(self._hist)
         if not h:
             e = np.zeros(0)
             return {"t": e, "f0": e, "smooth_hz": e, "gate": e.astype(bool)}
@@ -409,7 +442,8 @@ class PitchEngine:
 
     def get_spectrogram(self):
         """2-D array (freq bins x time columns), dB. Oldest column first."""
-        cols = list(self._spec_cols)
+        with self._lock:
+            cols = list(self._spec_cols)
         if not cols:
             return np.zeros((1, 1))
         return np.stack(cols, axis=1)

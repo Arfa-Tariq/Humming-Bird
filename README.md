@@ -9,6 +9,24 @@ python -m venv .venv
 .venv\Scripts\activate        (Windows)
 pip install -r requirements.txt
 
+## Play
+```
+python -m app.game                       # microphone, with synthetic fallback
+python -m app.game --source synthetic    # demo without a microphone
+python -m app.game --source data/hum.wav # loop a WAV file
+python -m app.game --device 1           # choose an input device
+```
+Choose Start or press Enter. For a microphone, stay quiet during noise
+calibration, then hum the lowest and highest comfortable notes and press Enter
+for each. Hum higher to fly higher. SPACE switches to manual flapping; P returns
+to pitch control. The bird holds its last pitch when sound is not detected.
+
+Press D to open the dashboard (gameplay pauses). Its key map shows the live
+controls: 1/2/3 select FFT/AMDF/ACF, W changes window, B bypasses the filter,
+M switches hum/whistle, [ and ] change frame size, N cycles injected noise, and
+C recalibrates the microphone. Escape returns to the game/menu. Synthetic and
+WAV sources use a preset pitch range and skip microphone calibration.
+
 ## Run tests
 pytest
 
