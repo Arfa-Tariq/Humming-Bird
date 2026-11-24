@@ -56,33 +56,149 @@ def test_synthetic_engine_and_dashboard_during_live_reconfiguration(monkeypatch)
         pygame.quit()
 
 
-def test_pitch_game_movement_and_manual_fallback():
+def empty_game():
     game.reset_game()
     game.game_state = "game"
-    game.flowers = [game.create_flower(1000, 120)]
-    game.bees = [{"x": 1000, "y": 60, "start_y": 60, "direction": -1, "wing": 0}]
+    game.flowers = []
+    game.walls = []
+
+
+def advance(state, pitch_range, pitch_control, seconds, dt=1 / 60):
+    for _ in range(round(seconds / dt)):
+        game.update_game(state, pitch_range, pitch_control, dt)
+
+
+def test_pitch_movement_is_smooth_and_manual_flap_uses_gravity():
+    empty_game()
     pitch_range = PitchRange(-12, 0)
     game.update_game({"semitone": 0}, pitch_range, True)
-    assert game.bird_y == 8
+    assert 98 < game.bird_y < 100  # A pitch change must not teleport the bird.
+    advance({"semitone": 0}, pitch_range, True, 2)
+    assert game.bird_y == pytest.approx(14, abs=0.2)
     game.update_game({"semitone": -12}, pitch_range, True)
-    assert game.bird_y == 156
-    game.update_game({"semitone": None}, pitch_range, True)
-    assert game.bird_y == 156
-    game.bird_velocity = game.FLAP_STRENGTH
+    assert 14 < game.bird_y < 16
+    advance({"semitone": -12}, pitch_range, True, 2)
+    assert game.bird_y == pytest.approx(game.ground_y - game.bird_height - 12, abs=0.2)
+    before = game.bird_y
+    game.flap()
     game.update_game({}, pitch_range, False)
-    assert game.bird_y < 156
+    assert game.bird_y < before
+    assert game.bird_velocity > game.FLAP_STRENGTH
 
 
-def test_pitch_landing_detects_crossing_a_flower():
-    game.reset_game()
-    game.game_state = "game"
-    game.flowers = [game.create_flower(90, 120), game.create_flower(1000, 120)]
-    game.bees = [{"x": 1000, "y": 60, "start_y": 60, "direction": -1, "wing": 0}]
-    game.bird_y = 40
-    game.update_game({"semitone": -12}, PitchRange(-12, 0), True)
+def test_pitch_dropout_grace_then_gravity_and_reacquisition():
+    empty_game()
+    pitch_range = PitchRange(-12, 0)
+    game.bird_y = pitch_range.height(-6, 14, game.ground_y - game.bird_height - 12)
+    advance({"semitone": -6, "gate_open": True}, pitch_range, True, 0.2)
+    original = game.bird_y
+    advance({"semitone": -6, "gate_open": False}, pitch_range, True, 0.2)
+    assert game.bird_y == pytest.approx(original, abs=0.01)
+    advance({"semitone": -6, "gate_open": False}, pitch_range, True, 0.3)
+    assert game.bird_y > original + 5
+    falling = game.bird_y
+    advance({"semitone": 0, "gate_open": True}, pitch_range, True, 0.6)
+    assert game.bird_y < falling
+
+
+def test_landing_stays_safe_until_voice_takeoff_and_scores_once():
+    empty_game()
+    game.flowers = [game.create_flower(90, 120)]
+    game.bird_y = 103
+    game.bird_velocity = 80
+    pitch_range = PitchRange(-12, 0)
+    advance({"semitone": -12}, pitch_range, True, 0.1)
     assert game.landing
     assert game.score == 1
-    assert game.bird_y == 111
+    assert game.bird_y == 120 - 5 - game.bird_height
+    stopped = game.bird_y, game.camera_x
+    advance({"semitone": -12}, pitch_range, True, 2)
+    advance({"semitone": None, "gate_open": False}, pitch_range, True, 2)
+    assert game.landing and (game.bird_y, game.camera_x) == stopped
+    advance({"semitone": 0, "gate_open": True}, pitch_range, True, 0.1)
+    assert not game.landing and game.bird_y < stopped[0]
+    # Landing on the same flower again must not farm points.
+    game.bird_y = stopped[0]
+    game.bird_velocity = 60
+    game.update_game({}, pitch_range, False)
+    assert game.landing and game.score == 1
+    game.flap()
+    game.update_game({}, pitch_range, False)
+    assert not game.landing and game.bird_velocity < 0
+
+
+def test_game_physics_follow_elapsed_time():
+    heights = []
+    for dt in (1 / 30, 1 / 60, 1 / 120):
+        empty_game()
+        advance({"semitone": 0}, PitchRange(-12, 0), True, 0.5, dt)
+        assert game.camera_x == pytest.approx(22.5, abs=0.01)
+        heights.append(game.bird_y)
+    assert max(heights) - min(heights) < 1.0
+    assert 40 < heights[0] < 60
+
+
+@pytest.mark.parametrize("y, collision", [(70, False), (30, True), (120, True)])
+def test_wall_gap_collision_matches_flight_path(y, collision):
+    empty_game()
+    game.bird_y = y
+    game.walls = [{"x": game.bird_x + 5, "gap_top": 50, "passed": False}]
+    game.update_game({}, None, False)
+    assert (game.game_state == "game_over") is collision
+
+
+def test_wall_is_scored_once_after_clearing_gap():
+    empty_game()
+    game.bird_y = 70
+    wall = {"x": game.bird_x - game.WALL_WIDTH - 1, "gap_top": 50, "passed": False}
+    game.walls = [wall]
+    advance({}, None, False, 0.1)
+    assert wall["passed"] and game.gaps_passed == 1
+    advance({}, None, False, 0.1)
+    assert game.gaps_passed == 1
+
+
+def test_game_clears_a_wall_while_holding_a_pitch():
+    empty_game()
+    pitch_range = PitchRange(-12, 0)
+    game.bird_y = 72
+    wall = {"x": game.bird_x + 35, "gap_top": 50, "passed": False}
+    game.walls = [wall]
+    fraction = (game.ground_y - game.bird_height - 12 - game.bird_y) / (
+        game.ground_y - game.bird_height - 12 - 14)
+    semitone = pitch_range.low + fraction * (pitch_range.high - pitch_range.low)
+    advance({"semitone": semitone, "gate_open": True}, pitch_range, True, 1.5)
+    assert game.game_state == "game" and wall["passed"] and game.gaps_passed == 1
+
+
+def test_generated_flowers_are_between_walls():
+    game.reset_game()
+    game.game_state = "game"
+    game.update_game({"semitone": -6}, PitchRange(-12, 0), True)
+    assert [wall["x"] for wall in game.walls[:2]] == [400, 590]
+    assert any(flower["x"] == 495 for flower in game.flowers)
+    assert any(flower["x"] == 685 for flower in game.flowers)
+    assert all(0 < wall["gap_top"] < wall["gap_top"] + game.WALL_GAP < game.ground_y
+               for wall in game.walls)
+
+
+def test_synthetic_audio_drives_smooth_flight():
+    empty_game()
+    engine = PitchEngine(source="synthetic")
+    try:
+        engine.start()
+        wait_for(lambda: engine.get_state().get("f0"))
+        positions = [game.bird_y]
+        for _ in range(60):
+            game.update_game(engine.get_state(), default_range(), True)
+            positions.append(game.bird_y)
+            time.sleep(1 / 60)
+        assert positions[-1] < positions[0] - 5
+        assert max(abs(b - a) for a, b in zip(positions, positions[1:])) <= (
+            game.MAX_FALL_SPEED / 60 + 1e-6)
+        assert game.game_state == "game" and engine.last_error is None
+    finally:
+        engine.stop()
 
 
 def test_failed_microphone_starts_synthetic_and_cleans_up(monkeypatch):
@@ -266,7 +382,7 @@ def test_game_runs_guided_microphone_calibration(monkeypatch):
     monkeypatch.setattr(game, "start_audio", lambda source, device: (engine, None))
     monkeypatch.setattr(game, "Calibration", FastCalibration)
     captured = []
-    monkeypatch.setattr(game, "update_game", lambda state, pitch_range, control:
+    monkeypatch.setattr(game, "update_game", lambda state, pitch_range, control, dt:
                         captured.append((pitch_range, control)))
     key = lambda k: pygame.event.Event(pygame.KEYDOWN, key=k)
     frames = iter([

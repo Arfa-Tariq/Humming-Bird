@@ -603,7 +603,7 @@ def draw_menu(surface):
     for i, x in enumerate([20, 65, 260, 295]):
 
         flower = {
-            "x": x,
+            "x": x + camera_x,  # Menu decorations stay fixed after returning from a game.
             "y": 153,
             "colour": flower_colours[i % len(flower_colours)]
         }
@@ -947,7 +947,7 @@ def draw_calibration(surface, calibration, state):
 
 
 def main(argv=None):
-    global game_state, bird_velocity
+    global game_state
     from app.dashboard import Dashboard, handle_engine_key
 
     parser = argparse.ArgumentParser(description="Pitch-controlled Humming Bird")
@@ -1067,8 +1067,7 @@ def main(argv=None):
                     pitch_control = True
                 elif key == pygame.K_SPACE and game_state == "game" and not dashboard_visible:
                     pitch_control = False
-                    if not landing:
-                        bird_velocity = FLAP_STRENGTH
+                    flap()
                 elif key == pygame.K_RETURN and not dashboard_visible:
                     if game_state in ("menu", "game_over"):
                         begin_game()
@@ -1104,7 +1103,7 @@ def main(argv=None):
                 elif game_state == "calibration":
                     draw_calibration(canvas, calibration, state)
                 elif game_state == "game":
-                    update_game(state, pitch_range, pitch_control)
+                    update_game(state, pitch_range, pitch_control, dt=elapsed)
                     draw_game(canvas, pitch_control, state)
                 elif game_state == "game_over":
                     draw_game_over(canvas)

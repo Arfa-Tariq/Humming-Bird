@@ -18,8 +18,10 @@ python -m app.game --device 1           # choose an input device
 ```
 Choose Start or press Enter. For a microphone, stay quiet during noise
 calibration, then hum the lowest and highest comfortable notes and press Enter
-for each. Hum higher to fly higher. SPACE switches to manual flapping; P returns
-to pitch control. The bird holds its last pitch when sound is not detected.
+for each. Hum higher to rise and lower to descend through the wall gaps. Brief
+pitch dropouts are ignored; longer silence makes the bird fall. Land on a flower
+to stop safely, then hum higher to take off. SPACE switches to manual flapping
+(and takes off from a flower); P returns to pitch control.
 
 Press D to open the dashboard (gameplay pauses). Its key map shows the live
 controls: 1/2/3 select FFT/AMDF/ACF, W changes window, B bypasses the filter,
