@@ -73,3 +73,12 @@ def test_latency_stats():
 def test_latency_needs_enough_trials():
     with pytest.raises(ValueError):
         latency_stats([100, 110, 90])
+
+def test_summarize_counts_false_accept_on_silence():
+    f_est = [440.0, 440.0, 300.0]            # estimator "heard" something in frame 3
+    f_true = [440.0, 440.0, np.nan]          # frame 3 is silence
+    voiced = [True, True, False]
+    s = summarize(f_est, f_true, truly_voiced=voiced)
+    assert s["silence_false_accept"] == pytest.approx(1.0)
+    assert s["voiced_accepted"] == pytest.approx(1.0)
+    assert s["rmse_cents"] == pytest.approx(0.0)   # silent frame not scored

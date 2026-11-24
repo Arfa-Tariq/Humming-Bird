@@ -96,10 +96,12 @@ def silence_falsely_accepted(accepted, truly_voiced):
 
 
 def summarize(f_est, f_true, truly_voiced=None):
-    """One-call summary used by every experiment so all of them report the same
-    numbers: RMSE, gross error rate, octave error rate and accepted fraction."""
+    est = _to_float_array(f_est)
+    accepted = np.isfinite(est) & (est > 0)          # from the estimate, not the error
     err = cents_error(f_est, f_true)
-    accepted = np.isfinite(err)
+    if truly_voiced is not None:
+        voiced = np.asarray(truly_voiced, dtype=bool)
+        err = np.where(voiced, err, np.nan)          # score only voiced frames
     out = {
         "rmse_cents": rmse_cents(err),
         "gross_error_pct": gross_error_rate(err),
@@ -107,9 +109,10 @@ def summarize(f_est, f_true, truly_voiced=None):
         "accepted_frac": float(accepted.mean()) if accepted.size else float("nan"),
     }
     if truly_voiced is not None:
-        out["voiced_accepted"] = voiced_accepted_rate(accepted, truly_voiced)
-        out["silence_false_accept"] = silence_falsely_accepted(accepted, truly_voiced)
+        out["voiced_accepted"] = voiced_accepted_rate(accepted, voiced)
+        out["silence_false_accept"] = silence_falsely_accepted(accepted, voiced)
     return out
+
 
 
 def latency_stats(latencies_ms, min_trials=10):
